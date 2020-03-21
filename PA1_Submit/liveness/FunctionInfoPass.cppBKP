@@ -1,0 +1,298 @@
+	
+namespace {
+	    class LiveAnalysisPass : public FunctionPass {
+	        public:
+	            static char ID;
+	            LiveAnalysisPass() : FunctionPass(ID) {
+	                  
+	            }
+	            ~LiveAnalysisPass() { }
+	
+
+	            // We don't modify the program, so we preserve all analyses
+	            void getAnalysisUsage(AnalysisUsage &AU) const override {
+	                /* Name those unamed temporary variables,
+	                 * pass InstructionNamerID first */
+	                AU.addRequiredID(llvm::InstructionNamerID);
+	            }
+	
+
+	            // Print output for each function
+	            bool runOnFunction(Function &F) override {
+	                /* see each block and find every definition and uses */
+	                add_UEVar_and_VarKill_helper(F);
+	                
+	                errs() << "\nLiveness Analysis\n";
+	
+
+	                /* backward liveness analysis */
+	                backward_liveness_analysis(F);
+	                
+	                errs() << "\nLiveness Analysis Results\n";
+	                print_result(F);
+	
+
+	                return false;
+	            }
+	            
+	            void backward_liveness_analysis(Function& F) 
+	            {
+	                std::deque<Instruction*> deque;
+	
+
+	                /* push all instructions to the queue */
+	                for (auto inst = inst_begin(F); inst != inst_end(F); inst++) {
+	                    LiveInMap[&*inst] = std::set<StringRef>();
+	                    deque.push_front(&(*inst));
+	                }
+	                
+	                std::set<StringRef> succ_set;
+	                std::set<StringRef> curr_live_in_set;
+	                while (!deque.empty()) 
+	                {
+	                    Instruction* curr_inst = deque.front();
+	                    deque.pop_front();
+	                    /* calcuate each successor's live-in set */
+	                    if (isa<BranchInst>(curr_inst)) {
+	                        BranchInst* branch_inst = dyn_cast<BranchInst>(curr_inst);
+	                        for (unsigned i = 0; i < branch_inst->getNumSuccessors(); i++) {
+	                            BasicBlock* succ_bb = branch_inst->getSuccessor(i);
+	                            Instruction* succ_inst = &(*succ_bb->begin());
+	                            get_live_out_set(succ_inst, succ_set);
+	                        }
+	                        errs() << "Branch instruction: "; branch_inst->dump();
+	                    }
+	                    else if (isa<PHINode>(curr_inst)) {
+	                        Instruction* succ_inst = curr_inst->getParent()->getFirstNonPHI();
+	                        get_live_out_set(succ_inst, succ_set);
+	                    }
+	                    else {
+	                        errs() << "Inst: "; curr_inst->dump();
+	                        Instruction* succ_inst = curr_inst->getNextNode();
+	                        get_live_out_set(succ_inst, succ_set);
+	                    }
+	                    
+	                    /* In case that initial live-out has some elements */
+	                    for (auto e : LiveOutMap[curr_inst]) {
+	                        if (succ_set.find(e) == succ_set.end()) succ_set.insert(e);
+	                    }
+	
+
+	                    /* succ_set is the live-out */
+	                    LiveOutMap[curr_inst] = succ_set;
+	
+
+	                    errs() << "current instruction " << curr_inst->getName() << " live-out: ";
+	                    debug_print_helper(LiveOutMap[curr_inst]);
+	
+
+	                    /* get curr_inst's live-in */
+	                    curr_live_in_set = succ_set;
+	                    succ_set.clear();
+	                    for (auto e : VarKillMap[curr_inst]) {
+	                        curr_live_in_set.erase(e);        
+	                    }
+	                    for (auto e : UEVarMap[curr_inst]) {
+	                        if (curr_live_in_set.find(e) == curr_live_in_set.end()) {
+	                            curr_live_in_set.insert(e);
+	                        }
+	                    }
+	                    
+	                    /* special handling for phi */
+	                    if (isa<PHINode>(curr_inst)) {
+	                        /* erase other phi-node */
+	                        erase_following_phi(curr_inst, curr_live_in_set); 
+	                    }
+	
+
+	                    errs() << "current instruction " << curr_inst->getName() << " live-in: ";
+	                    debug_print_helper(curr_live_in_set);
+	                    
+	                    /* if live-in has changed */
+	                    if (LiveInMap[curr_inst] != curr_live_in_set) {
+	                        /* insert predecessors of current instructions */
+	                        if (curr_inst != &(*curr_inst->getParent()->begin()) && curr_inst == curr_inst->getParent()->getFirstNonPHI()) {
+	                            deque.push_back(&(*curr_inst->getParent()->begin()));
+	                            errs() << "Push to the worklikst: "; curr_inst->getParent()->begin()->dump();
+	                        }
+	                        else if (curr_inst == &(*curr_inst->getParent()->begin())) {
+	                            /* find predecessor blocks' terminator */
+	                            for (auto pred_bb = pred_begin(curr_inst->getParent()); pred_bb != pred_end(curr_inst->getParent()); pred_bb++) {
+	                                if (auto pred_terminator = (*pred_bb)->getTerminator()) {
+	                                    errs() << "Push to the worklikst (predecessor): "; pred_terminator->dump();
+	                                    deque.push_back(pred_terminator);
+	                                }
+	                            }
+	                        }
+	                        else if (isa<PHINode>(curr_inst)) {
+	                            PHINode* phi_node = dyn_cast<PHINode>(curr_inst); 
+	                            for (unsigned i = 0; i < phi_node->getNumIncomingValues(); i++) {
+	                                Value* incoming_val = phi_node->getIncomingValue(i);
+	                                BasicBlock* incoming_block = phi_node->getIncomingBlock(i);
+	                                Instruction* terminator = incoming_block->getTerminator();
+	                                deque.push_back(terminator);
+	                                errs() << "Push to the worklikst (PHI node predecessor): "; terminator->dump();
+	                            }
+	                        }
+	                        else {
+	                            if (curr_inst->getPrevNode()) {
+	                                deque.push_back(curr_inst->getPrevNode());
+	                                errs() << "Push to the worklikst: "; curr_inst->getPrevNode()->dump();
+	                            }
+	                        }
+	                    }
+	                    LiveInMap[curr_inst] = curr_live_in_set;
+	                    curr_live_in_set.clear();
+	                    
+	                    errs() << "\n";
+	                }
+	            }
+	            
+	            void erase_following_phi(Instruction* _inst, std::set<StringRef>& _set)
+	            {
+	                //PHINode* phi_node = dyn_cast<PHINode>(curr_inst);
+	                Instruction* proc_inst = _inst;
+	                while (proc_inst != &(*_inst->getParent()->getFirstNonPHI())) {
+	                    assert(isa<PHINode>(proc_inst));
+	                    if (_set.find(proc_inst->getName()) != _set.end()) {
+	                        _set.erase(proc_inst->getName());       
+	                    }
+	                    proc_inst = proc_inst->getNextNode();
+	                }
+	            }
+	
+
+	            void get_live_out_set(Value* succ_val, std::set<StringRef>& _set)
+	            {
+	                for (auto e : LiveInMap[succ_val]) { 
+	                    if (_set.find(e) == _set.end()) {
+	                        _set.insert(e);
+	                    }
+	                }
+	            }
+	
+
+	            void get_live_in_set(Value* val, std::set<StringRef>& _set) 
+	            {
+	                std::set<StringRef> live_not_kill_set(LiveOutMap[val]);
+	                /* union with the complement of VarKill(succ_inst) */
+	                for (auto e : VarKillMap[val]) {
+	                    live_not_kill_set.erase(e);
+	                }
+	                /* intersect with UEVar(succ_inst) */
+	                std::set_intersection(
+	                        UEVarMap[val].begin(), 
+	                        UEVarMap[val].end(),
+	                        live_not_kill_set.begin(),
+	                        live_not_kill_set.end(),
+	                        std::inserter(_set, _set.begin())
+	                );
+	            }
+	
+
+	            void add_UEVar_and_VarKill_helper(Function& F)
+	            {
+	                /* Initialization */
+	                for (auto inst = inst_begin(F); inst != inst_end(F); inst++) {
+	                    UEVarMap[&*inst] = std::set<StringRef>();
+	                    VarKillMap[&*inst] = std::set<StringRef>();     
+	                    LiveOutMap[&*inst] = std::set<StringRef>();
+	                }
+	
+
+	                /* Add arguments */
+	
+
+	                for (auto bb = F.begin(); bb != F.end(); bb++) {
+	                    for (auto inst = bb->begin(); inst != bb->end(); inst++) {
+	                        // add operands to UEVar
+	                        if (isa<StoreInst>(inst)) {
+	                            StoreInst* store_inst = dyn_cast<StoreInst>(inst);
+	                            if (!isa<Constant>(store_inst->getValueOperand())) {
+	                                UEVarMap[&*inst].insert(store_inst->getValueOperand()->getName());
+	                            }
+	                            VarKillMap[&*inst].insert(store_inst->getPointerOperand()->getName());
+	                            continue;
+	                        }
+	                        else if (isa<PHINode>(inst)) {
+	                            PHINode* phi_node = dyn_cast<PHINode>(inst);
+	                            for (unsigned i = 0; i < phi_node->getNumIncomingValues(); i++) {
+	                                Value* incoming_val = phi_node->getIncomingValue(i);
+	                                BasicBlock* incoming_block = phi_node->getIncomingBlock(i);
+	                                Instruction* terminator = incoming_block->getTerminator();
+	                                if (isa<Constant>(incoming_val)) continue;
+	                                //UEVarMap[terminator].insert(incoming_val->getName());
+	                                LiveOutMap[terminator].insert(incoming_val->getName());
+	                                errs() << "Phi Node Terminator: "; terminator->dump();
+	                                errs() << "Incoming Val: "; incoming_val->dump();
+	                            }
+	                            continue;
+	                        }
+	                        else if (isa<BranchInst>(inst)) {
+	                            BranchInst* branch_inst = dyn_cast<BranchInst>(inst);
+	                            if (branch_inst->isConditional()) {
+	                                UEVarMap[&*inst].insert(branch_inst->getOperand(0)->getName());
+	                            }
+	                        }
+	                        else if (isa<CallInst>(inst)) {
+	                            CallInst* call_inst = dyn_cast<CallInst>(inst);
+	                            for (unsigned i = 0; i < call_inst->getNumOperands()-1; i++) {
+	                                //call_inst->getOperand(i)->dump();
+	                                UEVarMap[&*inst].insert(call_inst->getOperand(i)->getName());
+	                            }
+	                        }
+	                        else if (isa<AllocaInst>(inst)) {
+	                            // do nothing   
+	                        }
+	                        else {
+	                            for (auto op = inst->op_begin(); op != inst->op_end(); op++) {
+	                                if (!isa<Constant>(op->get()) && !isa<GlobalVariable>(op->get())) {
+	                                    UEVarMap[&*inst].insert(op->get()->getName());               
+	                                }
+	                            }
+	                        }
+	                        // add destination to VarKill
+	                        if (!isa<ReturnInst>(inst) && !isa<CallInst>(inst) && !isa<BranchInst>(inst)) {
+	                            VarKillMap[&*inst].insert(inst->getName());
+	                        }
+	                        errs() << "current instruction "; inst->dump(); 
+	                        errs() << "UEVar:     "; debug_print_helper(UEVarMap[&*inst]);
+	                        errs() << "current instruction "; inst->dump();
+	                        errs() << "VarKill:   "; debug_print_helper(VarKillMap[&*inst]);
+	                    }       
+	                }
+	            }
+	            
+	        private:
+	            std::unordered_map<Value*, std::set<StringRef>> UEVarMap; 
+	            std::unordered_map<Value*, std::set<StringRef>> LiveInMap; 
+	            std::unordered_map<Value*, std::set<StringRef>> LiveOutMap; 
+	            std::unordered_map<Value*, std::set<StringRef>> VarKillMap; 
+	            
+	            void print_result(Function& F) 
+	            {
+	                errs() << "Initially, \n";
+	                errs() << "Live-Set:     "; debug_print_helper(LiveInMap[&(*inst_begin(F))]);
+	 
+	                for (auto inst = inst_begin(F); inst != inst_end(F); inst++) {
+	                    errs() << "Instruction "; inst->dump(); 
+	                    errs() << "Live-Set:     "; debug_print_helper(LiveOutMap[&*inst]);
+	                    errs() << "\n";   
+	                }
+	            }
+	
+
+	            void debug_print_helper(std::set<StringRef>& _set) {
+	                /* print all elements of the set */
+	                errs() << " { ";
+	                for_each(_set.begin(), _set.end(), 
+	                    [](StringRef str_ref) {
+	                        errs() << str_ref << ", ";  
+	                    }
+	                );
+	                errs() << " }\n";
+	            }
+	    };
+	}
+	
+
